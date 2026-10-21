@@ -237,8 +237,9 @@ python3 -m cs336_alignment.train_grpo --dry-run --output-dir outputs/grpo-previe
 ```
 
 Read `config.json` and `prompt_preview.json`. Every invocation needs a new or
-empty output directory. The runner validates that microbatches contain complete
-groups, because your current train step normalizes rewards inside microbatches.
+empty output directory. The runner validates that training batches contain complete
+groups. Advantages are computed before splitting into microbatches, so a microbatch
+may be smaller than a group.
 It also requires temperature=1 and top-p=1: your on-policy loss scores the
 unmodified policy, so a different sampling distribution would require further
 algorithm changes. Generation length remains configurable.
@@ -436,5 +437,158 @@ snapshot and the training-loop tests with a tiny model and simulated generation:
 ```sh
 uv run --no-sync pytest tests/test_grpo.py::test_grpo_train_step_standard_on_policy \
   tests/test_grpo_metadata.py tests/test_train_grpo.py -q
+```
+
+## Section 6.4: off-policy experiments
+
+The same training script and Modal runner support all four experiments through
+`--experiment`. The base estimator remains standard GRPO (group mean baseline,
+sample-standard-deviation advantages, sequence loss normalization).
+
+| Experiment | Importance weights | Default clipping epsilon |
+|---|---|---|
+| `offpolicy_naive` | None | — |
+| `offpolicy_noclip` | Token ratios | — |
+| `offpolicy_clip` | PPO/GRPO clipped token ratios | 0.2 |
+| `offpolicy_gspo` | Clipped geometric-mean sequence ratios | 0.0003 |
+
+Each preset uses 256 responses per rollout batch, 8 responses per optimizer
+update, and 1 microbatch per update. Thus **200 rollout batches mean 6,400
+optimizer updates per seed**, with 32 updates per inference batch. The remaining
+defaults match the standard experiment: 200 rollout batches, four-seed runs when
+requested below, learning rate 1e-5, group size 8, 512 maximum generated tokens,
+6,400 training questions, and 1,024 validation questions.
+
+The loop synchronizes the model to vLLM once before generating each training
+rollout batch. For the three importance-weighted methods, it then scores **all
+responses before the first update**, under `torch.no_grad()`, using the same
+prompt/response tokenization as the training step. These old-policy log probabilities
+are stored on the CPU and remain frozen across all 32 updates. The naive method
+skips that scoring pass. Updates consume contiguous complete groups; shuffling
+individual responses would break the group advantages.
+
+Log-softmax now runs in float32 even when model weights/activations use bfloat16.
+This retains precision for GSPO's small clipping range; both old and current
+log probabilities use the same computation. This also applies to future
+on-policy runs. Existing logs are not changed, and the plotter prevents combining
+seeds with different recorded log-probability precision.
+
+### Preview and smoke test
+
+Preview locally without model loading or a GPU:
+
+```sh
+python3 -m cs336_alignment.train_grpo \
+  --experiment offpolicy_gspo --dry-run \
+  --output-dir outputs/grpo/offpolicy-gspo-preview
+```
+
+Read `prompt_preview.json`: it should show `train_batch_size: 8`,
+`microbatch_size: 8`, `updates_per_rollout: 32`, and
+`planned_optimizer_steps: 6400`.
+
+Using the installed Modal CLI, run a short infrastructure check first:
+
+```sh
+modal run scripts/train_grpo_modal.py \
+  --experiment offpolicy_clip --run-name offpolicy-clip-smoke \
+  --seeds 0 --num-rollout-steps 2 \
+  --extra-args "--n-train-examples 64 --n-val-examples 32 --eval-every 1"
+```
+
+This starts a paid two-GPU job and performs 64 optimizer updates. Its smaller
+validation subset is for debugging only. A completed run downloads logs and
+generations into `outputs/grpo/offpolicy-clip-smoke/seed-0/`; checkpoints and
+offline W&B files remain on the `cs336-a5-grpo` Volume.
+
+### Run the four experiments
+
+Use distinct run names; each command runs four seeds sequentially:
+
+```sh
+modal run scripts/train_grpo_modal.py \
+  --experiment offpolicy_naive --run-name offpolicy-naive \
+  --seeds 0,1,2,3 --num-rollout-steps 200
+
+modal run scripts/train_grpo_modal.py \
+  --experiment offpolicy_noclip --run-name offpolicy-noclip \
+  --seeds 0,1,2,3 --num-rollout-steps 200
+
+modal run scripts/train_grpo_modal.py \
+  --experiment offpolicy_clip --run-name offpolicy-clip \
+  --seeds 0,1,2,3 --num-rollout-steps 200
+
+modal run scripts/train_grpo_modal.py \
+  --experiment offpolicy_gspo --run-name offpolicy-gspo \
+  --seeds 0,1,2,3 --num-rollout-steps 200
+```
+
+Optional overrides go in `--extra-args`, for example `"--cliprange 0.1"` for
+`offpolicy_clip`. `--train-batch-size` must divide the rollout batch size and
+contain complete groups; `--gradient-accumulation-steps` must divide the training
+batch size. `standard_on_policy` remains the default experiment with one update
+per rollout batch. Direct two-GPU execution uses the same options with
+`uv run --frozen --extra gpu python -m cs336_alignment.train_grpo`.
+
+### Interpret the logs and plot results
+
+- `step` and `progress/optimizer_step` count completed optimizer updates.
+- `progress/rollout_step` counts inference batches. Evaluation, rollout logging,
+  and periodic checkpoint intervals remain in **rollout batches**. Default
+  validation runs at optimizer steps 0, 320, 640, …, 6400.
+- `progress/behavior_policy_step` identifies the policy that generated the batch;
+  `progress/policy_lag_updates` runs from 0 through 31 before each update.
+- `policy/clip_fraction` counts gradient-clipped response tokens for GRPO and
+  gradient-clipped sequences for GSPO, among forwarded responses. `clip_count`
+  and `clip_total` permit weighted aggregation. It is zero for naive/noclip and
+  when `clip_total` is zero; the latter means no clipping observations.
+- Pruning and entropy metrics retain their training-step definitions. Training
+  rewards describe the responses consumed by that update, so they may fluctuate
+  sharply when each update contains only one prompt group.
+- `time/old_log_probs_seconds` measures scoring overhead. Generation/scoring time
+  is charged only to the first update of a rollout batch. Elapsed time includes
+  generation, scoring, training, and evaluation, excluding startup.
+- Training files `train-step-XXXX.jsonl` retain **rollout-batch** numbering.
+  Their `policy_step` fields, validation files, and checkpoint directories use
+  optimizer-update numbers. The final default checkpoint is `step-6400`.
+- `summary.json` and `status.json` distinguish `completed_steps` (optimizer
+  updates) from `completed_rollout_steps` (inference batches).
+
+Plot each experiment's four seeds separately; do not mix methods as if they
+were seeds of one experiment:
+
+```sh
+uv run --no-project --with matplotlib python -m cs336_alignment.plot_grpo \
+  --runs outputs/grpo/offpolicy-clip/seed-* \
+  --output-dir outputs/grpo/offpolicy-clip/plots \
+  --title "Off-policy GRPO clipping (4 seeds)"
+```
+
+This saves PNG/PDF figures for the existing metrics plus clipping, pruning, and
+policy age, with individual seeds and mean ±1 sample standard deviation. The
+default panels compare optimizer updates and elapsed seconds. For comparison at
+equal rollout budgets, generate another set with `--step-axis rollout` and a
+different output directory. That view keeps each rollout batch's final update;
+training metrics there are not averages over its 32 updates. Use validation
+reward versus elapsed time to assess speed, and versus rollout batches to assess
+sample efficiency. Compare final per-seed rewards and variance in `summary.json`.
+
+If a Modal run is interrupted, completed seeds have already been committed:
+
+```sh
+modal volume get cs336-a5-grpo runs/offpolicy-clip outputs/grpo-recovered
+```
+
+That command also downloads checkpoints; use individual remote log/config files
+if you only need lightweight results. Model checkpoints do not contain optimizer
+or RNG state and are not automatic exact-resume checkpoints.
+
+CPU verification of the off-policy loop and train step:
+
+```sh
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 uv run --no-sync pytest \
+  tests/test_train_grpo_off_policy.py tests/test_train_grpo.py \
+  tests/test_grpo_off_policy_step.py \
+  tests/test_grpo.py::test_grpo_train_step_off_policy -q
 ```
 

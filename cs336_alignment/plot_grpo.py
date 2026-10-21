@@ -1,4 +1,4 @@
-"""Save Section 4.3 metrics as paired update/time plots, with means across seeds."""
+"""Save GRPO metrics as paired step/time plots, with means and std across seeds."""
 
 import argparse
 import json
@@ -23,6 +23,11 @@ COMPARISONS = {
     "length_comparison": ("Response length (tokens)", "rollout/mean_response_tokens", "val/mean_response_tokens"),
 }
 ELAPSED = "time/elapsed_seconds"
+OPTIONAL_METRICS = {
+    "policy/clip_fraction": "Clip fraction (forwarded tokens or sequences)",
+    "train/fraction_pruned_sequences": "Fraction of zero-advantage sequences pruned",
+    "progress/policy_lag_updates": "Policy age before update (optimizer steps)",
+}
 
 
 def load_runs(directories):
@@ -42,6 +47,13 @@ def load_runs(directories):
         rows = [json.loads(line) for line in (directory / "metrics.jsonl").read_text().splitlines() if line]
         if runs and any(config[key] != runs[0]["config"][key] for key in comparable):
             raise ValueError("Only combine runs with the same experiment settings and datasets")
+        if runs:
+            def off_policy_settings(settings):
+                return (settings.get("experiment", "standard_on_policy"),
+                        settings.get("train_batch_size", settings["rollout_batch_size"]),
+                        settings.get("cliprange"), settings.get("log_probs_dtype", "model"))
+            if off_policy_settings(config) != off_policy_settings(runs[0]["config"]):
+                raise ValueError("Only combine runs with the same off-policy settings and log-probability precision")
         if any(config["seed"] == run["config"]["seed"] for run in runs):
             raise ValueError("Each run must have a distinct seed")
         runs.append({"config": config, "rows": rows})
@@ -59,13 +71,21 @@ def metric_series(runs, metric):
     return steps, values, means, stds
 
 
-def plot_series(runs, metric, wall_time=False):
+def plot_series(runs, metric, wall_time=False, step_axis="optimizer"):
     """Return per-seed x/y and aggregate x/mean/std, aligned by optimizer update.
 
     On the time axis, aggregate x is mean elapsed time at the matching update.
     This is deliberately not an interpolation/aggregation at fixed elapsed time.
     Untimed updates are omitted, never assigned an invented timestamp.
     """
+    if step_axis == "rollout":
+        # Keep completed rollout batches only, including the initial evaluation.
+        # Training metrics are from the final update, not a rollout-wide average.
+        runs = [{**run, "rows": [
+            {**row, "step": row.get("progress/rollout_step", row["step"])}
+            for row in run["rows"]
+            if row.get("progress/update_in_rollout", 1) == row.get("progress/updates_per_rollout", 1)
+        ]} for run in runs]
     steps, values, means, stds = metric_series(runs, metric)
     if not wall_time:
         return [steps for _ in runs], values, steps, means, stds
@@ -77,8 +97,8 @@ def plot_series(runs, metric, wall_time=False):
     return x_values, y_values, mean_times, [means[i] for i in indices], [stds[i] for i in indices]
 
 
-def draw_metric(ax, runs, metric, wall_time, label, color, linestyle):
-    x_values, values, mean_x, means, stds = plot_series(runs, metric, wall_time)
+def draw_metric(ax, runs, metric, wall_time, label, color, linestyle, step_axis="optimizer"):
+    x_values, values, mean_x, means, stds = plot_series(runs, metric, wall_time, step_axis)
     if not mean_x:
         ax.text(0.5, 0.5, "Elapsed time unavailable", ha="center", va="center", transform=ax.transAxes)
         return
@@ -92,13 +112,14 @@ def draw_metric(ax, runs, metric, wall_time, label, color, linestyle):
             marker="o", markersize=3.5, label=label)
 
 
-def draw_pair(axes, runs, title, curves):
+def draw_pair(axes, runs, title, curves, step_axis="optimizer"):
     """Draw the same metric(s) against completed updates and measured elapsed time."""
     for ax, wall_time in zip(axes, (False, True), strict=True):
         for metric, label, color, linestyle in curves:
-            draw_metric(ax, runs, metric, wall_time, label, color, linestyle)
-        ax.set(xlabel="Wall-clock time (seconds)" if wall_time else "Gradient steps (completed updates)",
-               ylabel=title, title="By elapsed time" if wall_time else "By optimizer update")
+            draw_metric(ax, runs, metric, wall_time, label, color, linestyle, step_axis)
+        step_label = "Rollout batches (completed)" if step_axis == "rollout" else "Gradient steps (completed updates)"
+        ax.set(xlabel="Wall-clock time (seconds)" if wall_time else step_label,
+               ylabel=title, title="By elapsed time" if wall_time else f"By {step_axis} step")
         ax.set_xlim(left=0)
         if all(metric.endswith(("mean_reward", "mean_format_reward")) for metric, *_ in curves):
             ax.set_ylim(-0.025, 1.025)
@@ -134,6 +155,8 @@ def main(argv=None):
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--title", help="Experiment label (defaults to the first run's parent directory)")
     parser.add_argument("--dpi", type=int, default=200, help="PNG resolution; PDF remains vector graphics")
+    parser.add_argument("--step-axis", choices=("optimizer", "rollout"), default="optimizer",
+                        help="Rollout mode uses only the final update in each rollout batch")
     args = parser.parse_args(argv)
     if args.dpi <= 0:
         parser.error("--dpi must be positive")
@@ -150,11 +173,17 @@ def main(argv=None):
     seeds = ", ".join(str(run["config"]["seed"]) for run in runs)
     subtitle = f"{config['model'].rsplit('/', 1)[-1]} | lr={config['learning_rate']:g} | group={config['group_size']} | seeds: {seeds}"
     notes = figure_notes(runs)
+    if args.step_axis == "rollout":
+        notes += "\nCompleted rollout batches only; training metrics show each batch's final update."
+    if any(any("policy/clip_fraction" in row for row in run["rows"]) for run in runs):
+        notes += "\nClipping/entropy describe forwarded responses; zero coverage is logged as zero."
     summaries = {}
-    for metric, label in METRICS.items():
+    metrics = METRICS | {metric: label for metric, label in OPTIONAL_METRICS.items()
+                         if all(any(metric in row for row in run["rows"]) for run in runs)}
+    for metric, label in metrics.items():
         steps, values, means, stds = metric_series(runs, metric)
         fig, axes = plt.subplots(1, 2, figsize=(14, 4.8), sharey=True)
-        draw_pair(axes, runs, label, [(metric, label, "#1f77b4", "-")])
+        draw_pair(axes, runs, label, [(metric, label, "#1f77b4", "-")], args.step_axis)
         filename = metric.replace("/", "_")
         save_figure(fig, args.output_dir, filename, f"{name} — {label}\n{subtitle}", notes, args.dpi)
         plt.close(fig)
@@ -169,7 +198,7 @@ def main(argv=None):
         curves = [(train_metric, "Train rollouts", "#1f77b4", "-"), (val_metric, "Validation", "#ff7f0e", "--")]
         comparisons[filename] = (label, curves)
         fig, axes = plt.subplots(1, 2, figsize=(14, 4.8), sharey=True)
-        draw_pair(axes, runs, label, curves)
+        draw_pair(axes, runs, label, curves, args.step_axis)
         save_figure(fig, args.output_dir, filename, f"{name} — {label}\n{subtitle}", notes, args.dpi)
         plt.close(fig)
 
@@ -177,11 +206,11 @@ def main(argv=None):
     overview_rows = [comparisons["reward_comparison"], comparisons["format_comparison"],
                      (METRICS["train/token_entropy"], [("train/token_entropy", "Train", "#1f77b4", "-")])]
     for pair, (label, curves) in zip(axes, overview_rows, strict=True):
-        draw_pair(pair, runs, label, curves)
+        draw_pair(pair, runs, label, curves, args.step_axis)
     save_figure(fig, args.output_dir, "overview", f"{name} — GRPO learning curves\n{subtitle}", notes, args.dpi)
     plt.close(fig)
 
-    result = {"num_seeds": len(runs), "metrics": summaries,
+    result = {"num_seeds": len(runs), "metrics": summaries, "step_axis": args.step_axis,
               "wall_time_aggregation": "Mean elapsed time at matching updates; std across seeds at matching updates.",
               "untimed_points": [{"seed": run["config"]["seed"], "step": row["step"]}
                                  for run in runs for row in run["rows"] if ELAPSED not in row]}

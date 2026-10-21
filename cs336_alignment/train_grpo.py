@@ -1,4 +1,4 @@
-"""Section 4.3: standard on-policy GRPO on GSM8K (one training GPU, one vLLM GPU).
+"""Sections 4.3/6.4: on- and off-policy GRPO (one training GPU, one vLLM GPU).
 
 Preview without ML dependencies: python -m cs336_alignment.train_grpo --dry-run
 See README.md for the 50-step pilot and four-seed Modal experiment.
@@ -18,8 +18,24 @@ from time import perf_counter
 from cs336_alignment.prompting_baselines import MODEL_ID, REPO_ROOT, load_examples
 
 
+EXPERIMENTS = {
+    "standard_on_policy": "none",
+    "offpolicy_naive": "none",
+    "offpolicy_noclip": "noclip",
+    "offpolicy_clip": "grpo",
+    "offpolicy_gspo": "gspo",
+}
+
+
+def algorithm_settings(args):
+    return {"baseline": "mean", "advantage_normalizer": "std", "std_correction": 1,
+            "importance_reweighting_method": EXPERIMENTS[args.experiment],
+            "loss_normalization": "sequence"}
+
+
 def make_parser():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--experiment", choices=EXPERIMENTS, default="standard_on_policy")
     parser.add_argument("--model", default=MODEL_ID)
     parser.add_argument("--prompt-file", type=Path, default=REPO_ROOT / "cs336_alignment/prompts/r1_zero.prompt")
     parser.add_argument("--reward-function", choices=("r1_zero", "question_only"), default="r1_zero")
@@ -32,18 +48,20 @@ def make_parser():
     parser.add_argument("--n-val-examples", type=int, default=1024)
     parser.add_argument("--num-rollout-steps", type=int, default=200)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
-    parser.add_argument("--rollout-batch-size", type=int, default=256, help="Number of responses; one optimizer step per rollout batch")
+    parser.add_argument("--rollout-batch-size", type=int, default=256, help="Number of responses generated per rollout batch")
+    parser.add_argument("--train-batch-size", type=int, help="Responses per optimizer update; defaults to rollout size on-policy, 8 off-policy")
     parser.add_argument("--group-size", type=int, default=8)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
+    parser.add_argument("--gradient-accumulation-steps", type=int, help="Microbatches per update; defaults to 32 on-policy, 1 off-policy")
+    parser.add_argument("--cliprange", type=float, help="Defaults to 0.2 for offpolicy_clip, 0.0003 for offpolicy_gspo")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--advantage-eps", type=float, default=1e-6)
     parser.add_argument("--sampling-temperature", type=float, default=1.0)
     parser.add_argument("--sampling-top-p", type=float, default=1.0)
     parser.add_argument("--sampling-max-tokens", type=int, default=512)
-    parser.add_argument("--eval-every", type=int, default=10)
+    parser.add_argument("--eval-every", type=int, default=10, help="Validation interval in rollout batches")
     parser.add_argument("--eval-batch-size", type=int, default=64)
     parser.add_argument("--log-rollouts-every", type=int, default=40)
-    parser.add_argument("--save-every", type=int, default=0, help="Periodic model checkpoints; 0 saves only the final model")
+    parser.add_argument("--save-every", type=int, default=0, help="Checkpoint interval in rollout batches; 0 saves only the final model")
     parser.add_argument("--policy-device", default="cuda:0")
     parser.add_argument("--vllm-gpu", type=int, default=1)
     parser.add_argument("--vllm-port", type=int, default=8000)
@@ -53,14 +71,24 @@ def make_parser():
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--wandb-mode", choices=("offline", "online", "disabled"), default="offline")
     parser.add_argument("--wandb-project", default="cs336-a5-grpo")
-    parser.add_argument("--wandb-group", default="standard-on-policy")
+    parser.add_argument("--wandb-group", help="Defaults to the experiment name")
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
 def validate_args(args):
+    on_policy = args.experiment == "standard_on_policy"
+    if args.train_batch_size is None:
+        args.train_batch_size = args.rollout_batch_size if on_policy else 8
+    if args.gradient_accumulation_steps is None:
+        args.gradient_accumulation_steps = 32 if on_policy else 1
+    if args.cliprange is None:
+        args.cliprange = {"offpolicy_clip": .2, "offpolicy_gspo": 3e-4}.get(args.experiment)
+    if args.wandb_group is None:
+        args.wandb_group = args.experiment.replace("_", "-")
     for name in (
         "n_train_examples", "n_val_examples", "num_rollout_steps", "rollout_batch_size",
+        "train_batch_size",
         "group_size", "gradient_accumulation_steps", "eval_every", "eval_batch_size",
         "log_rollouts_every", "sampling_max_tokens", "max_model_len",
     ):
@@ -68,11 +96,19 @@ def validate_args(args):
             raise ValueError(f"{name} must be positive")
     if args.group_size < 2:
         raise ValueError("group_size must be at least 2 for the sample standard deviation")
-    if args.rollout_batch_size % args.gradient_accumulation_steps:
-        raise ValueError("rollout_batch_size must be divisible by gradient_accumulation_steps")
-    microbatch = args.rollout_batch_size // args.gradient_accumulation_steps
-    if microbatch % args.group_size:
-        raise ValueError("Each microbatch must contain complete groups: microbatch_size must be divisible by group_size")
+    if args.rollout_batch_size % args.train_batch_size:
+        raise ValueError("rollout_batch_size must be divisible by train_batch_size")
+    if args.train_batch_size % args.group_size:
+        raise ValueError("Each training batch must contain complete response groups")
+    if args.train_batch_size % args.gradient_accumulation_steps:
+        raise ValueError("train_batch_size must be divisible by gradient_accumulation_steps")
+    if on_policy and args.train_batch_size != args.rollout_batch_size:
+        raise ValueError("standard_on_policy requires train_batch_size == rollout_batch_size")
+    if args.cliprange is not None:
+        if EXPERIMENTS[args.experiment] not in ("grpo", "gspo"):
+            raise ValueError("cliprange is only used by offpolicy_clip and offpolicy_gspo")
+        if not math.isfinite(args.cliprange) or args.cliprange < 0:
+            raise ValueError("cliprange must be finite and nonnegative")
     if args.n_train_examples < args.rollout_batch_size // args.group_size:
         raise ValueError("The training subset must contain at least one batch of prompts")
     if args.save_every < 0 or args.seed < 0 or args.eval_seed < 0:
@@ -84,7 +120,7 @@ def validate_args(args):
         raise ValueError("vllm_memory_utilization must be between 0 and 1")
     # The implemented loss scores the original policy, without sampling corrections.
     if args.sampling_temperature != 1.0 or args.sampling_top_p != 1.0:
-        raise ValueError("This strict on-policy implementation requires temperature=1 and top_p=1")
+        raise ValueError("Scoring the unmodified rollout policy requires temperature=1 and top_p=1")
     if not args.policy_device.startswith("cuda:") or not args.policy_device[5:].isdigit():
         raise ValueError("policy-device must be an indexed CUDA device, e.g. cuda:0")
     if args.vllm_gpu < 0 or args.vllm_gpu == int(args.policy_device[5:]):
@@ -130,8 +166,12 @@ def prepare_run(args):
         "val_data_sha256": hashlib.sha256(args.val_data.read_bytes()).hexdigest(),
         "subset_selection": "first N examples; fixed validation subset across seeds",
         "optimizer": {"name": "AdamW", "betas": [0.9, 0.95], "weight_decay": 0.0},
-        "algorithm": {"baseline": "mean", "advantage_normalizer": "std", "std_correction": 1,
-                      "importance_reweighting_method": "none", "loss_normalization": "sequence"},
+        "algorithm": algorithm_settings(args),
+        "log_probs_dtype": "float32",
+        "updates_per_rollout": args.rollout_batch_size // args.train_batch_size,
+        "planned_optimizer_steps": args.num_rollout_steps * (args.rollout_batch_size // args.train_batch_size),
+        "schedule_unit": "eval_every, log_rollouts_every, save_every count rollout batches; log step counts optimizer updates",
+        "clip_fraction_definition": "gradient-clipped fraction of forwarded response tokens (GRPO) or nonempty sequences (GSPO)",
         "versions": versions,
     }
     write_json(args.output_dir / "config.json", manifest)
@@ -139,7 +179,10 @@ def prepare_run(args):
         "prompt": preview, "ground_truth": train[0]["ground_truth"],
         "prompts_per_batch": args.rollout_batch_size // args.group_size,
         "responses_per_batch": args.rollout_batch_size,
-        "microbatch_size": args.rollout_batch_size // args.gradient_accumulation_steps,
+        "train_batch_size": args.train_batch_size,
+        "microbatch_size": args.train_batch_size // args.gradient_accumulation_steps,
+        "updates_per_rollout": manifest["updates_per_rollout"],
+        "planned_optimizer_steps": manifest["planned_optimizer_steps"],
         "train_sampling": sampling_params(args, args.group_size, args.seed),
         "validation_sampling": sampling_params(args, 1, args.eval_seed),
     })
@@ -235,6 +278,7 @@ class ExperimentLogger:
         concise = {key: round(value, 5) for key, value in values.items() if key in {
             "train/loss", "train/grad_norm_before_clip", "train/token_entropy",
             "reward/mean_reward", "val/mean_reward", "val/mean_format_reward",
+            "policy/clip_fraction", "progress/rollout_step", "progress/update_in_rollout",
         }}
         print(json.dumps({"step": step, **concise}), flush=True)
 
@@ -251,11 +295,43 @@ def save_checkpoint(model, tokenizer, directory, step):
     write_json(destination / "step.json", {"step": step, "contents": "model and tokenizer; no optimizer/RNG resume state"})
 
 
+def capture_old_log_probs(model, tokenizer, records, microbatch_size):
+    """Score every rollout before any update, retaining only frozen CPU logprobs.
+
+    Use the training step's separate prompt/response tokenization and shifted
+    labels, so rows and token positions remain aligned after batch slicing.
+    """
+    import torch
+    from cs336_alignment import grpo_utils
+
+    batch = grpo_utils.tokenize_prompt_and_output(
+        [row["prompt"] for row in records], [row["response"] for row in records], tokenizer,
+    )
+    device = next(model.parameters()).device
+    was_training = model.training
+    chunks = []
+    try:
+        model.eval()
+        with torch.no_grad():
+            for start in range(0, len(records), microbatch_size):
+                log_probs = grpo_utils.get_response_log_probs(
+                    model, batch["input_ids"][start:start + microbatch_size].to(device),
+                    batch["labels"][start:start + microbatch_size].to(device),
+                )["log_probs"]
+                chunks.append(log_probs.detach().float().cpu())
+    finally:
+        model.train(was_training)
+    return torch.cat(chunks)
+
+
 def run_training_loop(args, model, tokenizer, optimizer, server, train, val, template, reward_fn, logger):
-    """Synchronous on-policy loop, also exercised with a tiny CPU model in tests."""
+    """Generate once, then update on contiguous complete groups from that batch."""
     from cs336_alignment.grpo import grpo_train_step
 
     stream = PromptStream(train, args.seed)
+    method = EXPERIMENTS[args.experiment]
+    updates_per_rollout = args.rollout_batch_size // args.train_batch_size
+    optimizer_step = 0
     start_time = perf_counter()
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -271,7 +347,10 @@ def run_training_loop(args, model, tokenizer, optimizer, server, train, val, tem
         return rollout_metrics(records, "val"), records
 
     initial_metrics, initial_records = evaluate(0)
-    logger.log(0, initial_metrics | {"time/elapsed_seconds": perf_counter() - start_time}, initial_records[:8])
+    logger.log(0, initial_metrics | {
+        "time/elapsed_seconds": perf_counter() - start_time,
+        "progress/rollout_step": 0, "progress/optimizer_step": 0,
+    }, initial_records[:8])
     final_metrics = initial_metrics
     for step in range(1, args.num_rollout_steps + 1):
         step_started = perf_counter()
@@ -279,7 +358,7 @@ def run_training_loop(args, model, tokenizer, optimizer, server, train, val, tem
         examples = stream.take(args.rollout_batch_size // args.group_size)
         records = collect_rollouts(
             server, examples, template, sampling_params(args, args.group_size, args.seed + step),
-            reward_fn, tokenizer, batch_size=None, policy_step=step - 1,
+            reward_fn, tokenizer, batch_size=None, policy_step=optimizer_step,
         )
         log_rollouts = step == 1 or step % args.log_rollouts_every == 0 or step == args.num_rollout_steps
         if log_rollouts:
@@ -290,34 +369,72 @@ def run_training_loop(args, model, tokenizer, optimizer, server, train, val, tem
         score_cache = {(row["response"], row["ground_truth"]): {
             key: row[key] for key in ("reward", "format_reward", "answer_reward")
         } for row in records}
+        behavior_policy_step = optimizer_step
         try:
-            loss, metadata = grpo_train_step(
-                model, tokenizer, optimizer, args.gradient_accumulation_steps, args.max_grad_norm,
-                lambda response, truth: score_cache[(response, truth)],
-                [row["prompt"] for row in records], [row["response"] for row in records],
-                [row["ground_truth"] for row in records], args.group_size,
-                baseline="mean", advantage_eps=args.advantage_eps, advantage_normalizer="std",
-                importance_reweighting_method="none", loss_normalization="sequence",
-            )
+            scoring_started = perf_counter()
+            # Freeze the ENTIRE rollout batch before the first optimizer step.
+            # The naive baseline deliberately avoids this extra forward pass.
+            old_log_probs = None
+            if method != "none":
+                old_log_probs = capture_old_log_probs(
+                    model, tokenizer, records,
+                    args.train_batch_size // args.gradient_accumulation_steps,
+                )
+            scoring_seconds = perf_counter() - scoring_started
+            for update_index, start in enumerate(range(0, len(records), args.train_batch_size), start=1):
+                batch_records = records[start:start + args.train_batch_size]
+                batch_old = None if old_log_probs is None else old_log_probs[start:start + args.train_batch_size]
+                update_started = perf_counter()
+                loss, metadata = grpo_train_step(
+                    model, tokenizer, optimizer, args.gradient_accumulation_steps, args.max_grad_norm,
+                    lambda response, truth: score_cache[(response, truth)],
+                    [row["prompt"] for row in batch_records], [row["response"] for row in batch_records],
+                    [row["ground_truth"] for row in batch_records], args.group_size,
+                    baseline="mean", advantage_eps=args.advantage_eps, advantage_normalizer="std",
+                    importance_reweighting_method=method, old_log_probs=batch_old,
+                    cliprange=args.cliprange, loss_normalization="sequence",
+                )
+                optimizer_step += 1
+                metrics = dict(metadata) | rollout_metrics(batch_records, "rollout")
+                metrics.update({
+                    "train/loss": loss.detach(),
+                    "time/rollout_seconds": generation_seconds if update_index == 1 else 0.,
+                    "time/old_log_probs_seconds": scoring_seconds if update_index == 1 else 0.,
+                    "time/update_seconds": perf_counter() - update_started,
+                    "progress/rollout_step": step,
+                    "progress/optimizer_step": optimizer_step,
+                    "progress/update_in_rollout": update_index,
+                    "progress/updates_per_rollout": updates_per_rollout,
+                    "progress/behavior_policy_step": behavior_policy_step,
+                    "progress/policy_lag_updates": optimizer_step - 1 - behavior_policy_step,
+                })
+                if args.experiment != "standard_on_policy":
+                    # No clipping is performed by naive/noclip. A zero total
+                    # also distinguishes updates where every sequence was pruned.
+                    for key in ("clip_fraction", "clip_count", "clip_total"):
+                        metrics.setdefault(f"policy/{key}", 0.)
+                samples = batch_records[:8] if log_rollouts and update_index == 1 else []
+                last_update = update_index == updates_per_rollout
+                if last_update and (step % args.eval_every == 0 or step == args.num_rollout_steps):
+                    final_metrics, eval_records = evaluate(optimizer_step)
+                    metrics.update(final_metrics)
+                    samples = eval_records[:8]
+                metrics["time/elapsed_seconds"] = perf_counter() - start_time
+                logger.log(optimizer_step, metrics, samples)
+                write_json(args.output_dir / "status.json", {
+                    "status": "running", "completed_steps": optimizer_step,
+                    "completed_rollout_steps": step if last_update else step - 1,
+                    "update_in_rollout": update_index,
+                })
         except Exception:
             write_rollouts(args.output_dir / "rollouts" / f"failed-train-step-{step:04d}.jsonl", records)
             raise
-        metrics = dict(metadata) | rollout_metrics(records, "rollout")
-        metrics["train/loss"] = loss.detach()
-        metrics["time/rollout_seconds"] = generation_seconds
-        metrics["time/update_seconds"] = perf_counter() - step_started - generation_seconds
-        samples = records[:8] if log_rollouts else []
-        if step % args.eval_every == 0 or step == args.num_rollout_steps:
-            final_metrics, eval_records = evaluate(step)
-            metrics.update(final_metrics)
-            samples = eval_records[:8]
-        metrics["time/elapsed_seconds"] = perf_counter() - start_time
-        logger.log(step, metrics, samples)
-        write_json(args.output_dir / "status.json", {"status": "running", "completed_steps": step})
         if (args.save_every and step % args.save_every == 0) or step == args.num_rollout_steps:
-            save_checkpoint(model, tokenizer, args.output_dir, step)
+            save_checkpoint(model, tokenizer, args.output_dir, optimizer_step)
     summary = {
-        "seed": args.seed, "completed_steps": args.num_rollout_steps,
+        "seed": args.seed, "completed_steps": optimizer_step,
+        "completed_rollout_steps": args.num_rollout_steps,
+        "updates_per_rollout": updates_per_rollout,
         "initial_validation": initial_metrics, "final_validation": final_metrics,
         "elapsed_seconds": perf_counter() - start_time,
     }
@@ -376,8 +493,11 @@ def main(argv=None):
         write_json(args.output_dir / "config.json", manifest)
         logger = ExperimentLogger(args, manifest)
         reward_fn = r1_zero_reward_fn if args.reward_function == "r1_zero" else question_only_reward_fn
-        run_training_loop(args, model, tokenizer, optimizer, server, train, val, template, reward_fn, logger)
-        write_json(args.output_dir / "status.json", {"status": "complete", "completed_steps": args.num_rollout_steps})
+        summary = run_training_loop(args, model, tokenizer, optimizer, server, train, val, template, reward_fn, logger)
+        write_json(args.output_dir / "status.json", {
+            "status": "complete", "completed_steps": summary["completed_steps"],
+            "completed_rollout_steps": summary["completed_rollout_steps"],
+        })
         failed = False
     except BaseException as error:
         status = json.loads((args.output_dir / "status.json").read_text())

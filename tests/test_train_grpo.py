@@ -85,7 +85,7 @@ def test_loop_updates_and_evaluates_current_weights(tmp_path, tiny_train_model, 
 
 @pytest.mark.parametrize("updates", [
     {"group_size": 1}, {"gradient_accumulation_steps": 3},
-    {"group_size": 4}, {"sampling_temperature": 0.7}, {"sampling_top_p": 0.95},
+    {"group_size": 3}, {"sampling_temperature": 0.7}, {"sampling_top_p": 0.95},
 ])
 def test_invalid_batch_and_sampling_configuration(tmp_path, updates):
     args = small_args(tmp_path)

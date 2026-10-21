@@ -46,7 +46,9 @@ def get_response_log_probs(
     # Make one forward pass through model
     logits = model(input_ids).logits # (B, L, V)
     # Convert scores to log probabilities
-    all_log_probs = torch.nn.functional.log_softmax(logits, dim=-1) # (B, L, V)
+    # GSPO's default cliprange is only 3e-4: retain float32 log probabilities
+    # even when the model itself uses bfloat16/float16 weights and activations.
+    all_log_probs = torch.nn.functional.log_softmax(logits, dim=-1, dtype=torch.float32) # (B, L, V)
     res = {}
     if return_token_entropy:
         # Entropy is a logging metric, so avoid retaining another gradient graph.

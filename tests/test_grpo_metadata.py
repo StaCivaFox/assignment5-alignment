@@ -69,7 +69,7 @@ def test_train_step_metadata(tiny_train_model, tokenizer, monkeypatch):
 
 def test_metadata_is_independent_of_microbatch_count(tiny_train_model, tokenizer, monkeypatch):
     prompts, responses, truths, _ = _train_step_inputs(tokenizer)
-    original_loss = grpo.compute_policy_gradient_loss_on_policy
+    original_loss = grpo.compute_policy_gradient_loss
 
     def loss_with_extra_metric(*args, **kwargs):
         loss, metadata = original_loss(*args, **kwargs)
@@ -77,7 +77,7 @@ def test_metadata_is_independent_of_microbatch_count(tiny_train_model, tokenizer
         metadata["example_variant_mean"] = args[0].square().mean()
         return loss, metadata
 
-    monkeypatch.setattr(grpo, "compute_policy_gradient_loss_on_policy", loss_with_extra_metric)
+    monkeypatch.setattr(grpo, "compute_policy_gradient_loss", loss_with_extra_metric)
     runs = []
     for accumulation_steps in (1, 2):
         model = copy.deepcopy(tiny_train_model)

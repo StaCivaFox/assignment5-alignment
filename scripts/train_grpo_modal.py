@@ -1,4 +1,4 @@
-"""Two-GPU Modal runner for Section 4.3; runs seeds sequentially and saves results."""
+"""Two-GPU Modal runner for Sections 4.3/6.4; saves each seed to a Volume."""
 
 from datetime import datetime, timezone
 import json
@@ -66,6 +66,7 @@ def train(run_name: str, seeds: list[int], arguments: list[str]) -> list[str]:
 
 @app.local_entrypoint()
 def main(
+    experiment: str = "standard_on_policy",
     seeds: str = "0",
     num_rollout_steps: int = 200,
     run_name: str = "",
@@ -79,7 +80,7 @@ def main(
     selected = [int(seed.strip()) for seed in seeds.split(",")]
     if not selected or min(selected) < 0 or len(set(selected)) != len(selected):
         raise ValueError("seeds must be distinct nonnegative integers")
-    arguments = ["--num-rollout-steps", str(num_rollout_steps), "--wandb-mode", wandb_mode, *shlex.split(extra_args)]
+    arguments = ["--experiment", experiment, "--num-rollout-steps", str(num_rollout_steps), "--wandb-mode", wandb_mode, *shlex.split(extra_args)]
     parsed = make_parser().parse_args(arguments)
     validate_args(parsed)
     if parsed.dry_run:
@@ -95,7 +96,9 @@ def main(
     local = Path(output_dir) / run_name
     if local.exists():
         raise ValueError(f"Local output directory already exists: {local}")
-    print(f"Run {run_name}: {GPU}, seeds {selected}, {parsed.num_rollout_steps} steps per seed", flush=True)
+    updates = parsed.num_rollout_steps * (parsed.rollout_batch_size // parsed.train_batch_size)
+    print(f"Run {run_name}: {parsed.experiment}, {GPU}, seeds {selected}, "
+          f"{parsed.num_rollout_steps} rollout batches / {updates} optimizer updates per seed", flush=True)
     print(f"Results: Modal Volume {VOLUME_NAME}/runs/{run_name}", flush=True)
     files = train.remote(run_name, selected, arguments)
     for filename in files:
