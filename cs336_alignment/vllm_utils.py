@@ -38,6 +38,7 @@ class VLLMServer:
     launch_server: bool = True
     startup_timeout: int = 600
     shutdown_timeout: int = 30
+    max_model_len: int | None = None
 
     def __post_init__(self) -> None:
         self.base_url = f"http://{self.host}:{self.port}"
@@ -56,6 +57,7 @@ class VLLMServer:
                 load_format=self.load_format,
                 logging_level=self.logging_level,
                 gpu_memory_utilization=self.gpu_memory_utilization,
+                max_model_len=self.max_model_len,
             )
             atexit.register(self.stop)
         wait_for_server(self.base_url, self.process, self.startup_timeout)
@@ -122,9 +124,16 @@ def start_server(
     load_format: str,
     logging_level: str,
     gpu_memory_utilization: float = 0.9,
+    max_model_len: int | None = None,
 ) -> subprocess.Popen:
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    # Preserve a container's existing logical-to-physical GPU mapping (or UUIDs).
+    visible_devices = env.get("CUDA_VISIBLE_DEVICES")
+    if visible_devices:
+        devices = [device.strip() for device in visible_devices.split(",")]
+        env["CUDA_VISIBLE_DEVICES"] = devices[gpu]
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     env["VLLM_SERVER_DEV_MODE"] = "1"
     env["VLLM_LOGGING_LEVEL"] = logging_level
     command = [
@@ -148,7 +157,15 @@ def start_server(
         json.dumps({"backend": "nccl"}),
         "--load-format",
         load_format,
+        "--generation-config",
+        "vllm",
+        # Uvicorn access logs are independent of VLLM_LOGGING_LEVEL.
+        "--disable-uvicorn-access-log",
+        "--uvicorn-log-level",
+        "warning",
     ]
+    if max_model_len is not None:
+        command.extend(["--max-model-len", str(max_model_len)])
     logger.info("Starting vLLM server: %s", " ".join(command))
     return subprocess.Popen(command, env=env, start_new_session=True)
 
@@ -197,10 +214,14 @@ def generate_completions(
             "model": model_id,
             "prompt": prompt_batch,
             "temperature": sampling_params["temperature"],
+            "top_p": sampling_params.get("top_p", 1.0),
+            "top_k": sampling_params.get("top_k", -1),
+            "min_p": sampling_params.get("min_p", 0.0),
             "max_tokens": sampling_params["max_tokens"],
             "n": sampling_params["n"],
             "seed": sampling_params["seed"],
             "return_token_ids": True,
+            "add_special_tokens": False,
         }
         if sampling_params.get("stop") is not None:
             payload["stop"] = sampling_params["stop"]

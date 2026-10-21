@@ -1,0 +1,252 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=25mm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage[colorlinks=true,linkcolor=blue,urlcolor=blue]{hyperref}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\sg}{\operatorname{stopgrad}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\as}{\xrightarrow{\mathrm{a.s.}}}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{6pt}
+\setlength{\emergencystretch}{2em}
+\allowdisplaybreaks[1]
+\hypersetup{
+  pdftitle={Deriving difficulty reweightings: CS336 Assignment 5},
+  pdfsubject={Section 5.3: Deriving difficulty reweightings},
+  pdfauthor={Study notes}
+}
+
+\begin{document}
+
+\begin{center}
+  {\LARGE\bfseries Deriving difficulty reweightings}\par
+  \vspace{4pt}
+  {\large CS336 Assignment 5, Section 5.3}\par
+  \texttt{derive\_difficulty\_reweightings}
+\end{center}
+
+\textbf{Source and scope.} These notes follow the Spring 2026 handout,
+pp.~28--29, especially its equations (39)--(43). Throughout, rewards are binary,
+the loss normalizer is the constant $Z=G$, and we take $G\to\infty$.
+Thus part (b) concerns GRPO with \emph{constant} loss normalization.
+
+Write $\eta_\theta(x)=\E_{y\sim\pi_\theta(\cdot\mid x)}[r(y\mid x)]$.
+The answers are the following prompt weights, evaluated at the current policy
+and held fixed when taking a gradient:
+\begin{center}
+\renewcommand{\arraystretch}{1.6}
+\begin{tabular}{lll}
+\toprule
+Part & Method & $w\bigl(x,\sg(\pi_\theta)\bigr)$ \\
+\midrule
+(a) & Dr. GRPO & $1$ \\
+(b) & GRPO, constant loss normalization & $\displaystyle \frac{1}{\sqrt{\eta_\theta(x)(1-\eta_\theta(x))}}$ \\
+(c) & MaxRL & $\displaystyle \frac{1}{\eta_\theta(x)}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+For (b), assume $0<\eta_\theta(x)<1$; for (c), assume $\eta_\theta(x)>0$.
+The last page discusses zero denominators and the finite-group case.
+
+\textbf{Notation.} Fix a prompt $x$ and the current parameters $\theta_0$.
+Sample $Y_1,\ldots,Y_G$ independently from $\pi_{\theta_0}(\cdot\mid x)$, and set
+\begin{equation}
+  R_j=r(Y_j\mid x),\qquad
+  S_j=\left.\nabla_\theta\log\pi_\theta(Y_j\mid x)\right|_{\theta=\theta_0},\qquad
+  \mu_G=\frac{1}{G}\sum_{j=1}^{G}R_j.
+\end{equation}
+Here $S_j$ is a vector, and $\eta=\eta_{\theta_0}(x)$ is the probability of a
+correct response. Higher $\eta$ means an easier prompt for this policy.
+Assume that the prompt distribution and reward function do not depend on
+$\theta$, and that differentiation and expectation can be interchanged.
+
+\textbf{Two identities used in every part.} The score has conditional mean zero:
+\begin{align}
+  \E[S_j\mid x]
+  &=\left.\sum_y \pi_\theta(y\mid x)
+                  \nabla_\theta\log\pi_\theta(y\mid x)\right|_{\theta_0} \notag\\
+  &=\left.\nabla_\theta\sum_y\pi_\theta(y\mid x)\right|_{\theta_0}
+   =\nabla_\theta 1=0. \label{eq:score-zero}
+\end{align}
+Multiplying by reward gives the policy-gradient identity:
+\begin{align}
+  \E[R_jS_j\mid x]
+  &=\left.\sum_y r(y\mid x)\nabla_\theta\pi_\theta(y\mid x)\right|_{\theta_0}
+   =\left.\nabla_\theta\eta_\theta(x)\right|_{\theta_0}.
+   \label{eq:reward-score}
+\end{align}
+Consequently, subtracting the population mean does not change this expectation:
+\begin{equation}
+  \E[(R_j-\eta)S_j\mid x]
+  =\E[R_jS_j\mid x]-\eta\E[S_j\mid x]
+  =\left.\nabla_\theta\eta_\theta(x)\right|_{\theta_0}.
+  \label{eq:baseline}
+\end{equation}
+
+\newpage
+
+\textbf{One calculation for all three normalizers.}
+Let $d_G$ denote the group normalizer: $1$, the group standard deviation, or
+$\mu_G$. At this fixed prompt, the estimator is
+\begin{align}
+  \widehat g_G(x)
+  &=\frac{1}{G}\sum_{j=1}^{G}\frac{R_j-\mu_G}{d_G}S_j \notag\\
+  &=\frac{1}{d_G}
+    \left(\frac{1}{G}\sum_{j=1}^{G}R_jS_j
+          -\mu_G\frac{1}{G}\sum_{j=1}^{G}S_j\right).
+    \label{eq:sample-rewrite}
+\end{align}
+Suppose $d_G\as d(x)>0$. The law of large numbers, applied to each vector
+coordinate, gives
+\begin{equation}
+  \mu_G\as\eta,\qquad
+  \frac{1}{G}\sum_j S_j\as 0,\qquad
+  \frac{1}{G}\sum_j R_jS_j
+    \as\left.\nabla_\theta\eta_\theta(x)\right|_{\theta_0}.
+\end{equation}
+Substituting these limits into \eqref{eq:sample-rewrite},
+\begin{equation}
+  \boxed{\displaystyle
+  \widehat g_G(x)\as
+    \frac{1}{d(x)}
+    \left.\nabla_\theta\eta_\theta(x)\right|_{\theta_0}.}
+  \label{eq:master}
+\end{equation}
+The required moments must exist; averaging this limit over prompts also
+requires the corresponding integrability/interchange conditions.
+
+To match the handout's stop-gradient surrogate, freeze the reference policy:
+\begin{equation}
+  J_w(\theta;\theta_0)
+  =\E_{x\sim\rho}\!\left[w(x,\pi_{\theta_0})\eta_\theta(x)\right].
+  \label{eq:frozen-objective}
+\end{equation}
+Its gradient at the current policy is
+\begin{equation}
+  \left.\nabla_\theta J_w(\theta;\theta_0)\right|_{\theta_0}
+  =\E_{x\sim\rho}\!\left[
+       w(x,\pi_{\theta_0})
+       \left.\nabla_\theta\eta_\theta(x)\right|_{\theta_0}\right].
+  \label{eq:surrogate-gradient}
+\end{equation}
+Comparing \eqref{eq:master} and \eqref{eq:surrogate-gradient} gives $w=1/d$.
+
+\textbf{(a) Dr. GRPO.} Here $d_G=1$, so $d(x)=1$ and
+\begin{equation}
+  \boxed{w_{\mathrm{Dr.\,GRPO}}(x,\pi_{\theta_0})=1.}
+\end{equation}
+The mean baseline cancels in expectation by \eqref{eq:baseline}. In the
+infinite-group limit, the estimator is therefore the gradient of ordinary
+expected reward, with the original prompt distribution $\rho$.
+
+\textbf{(b) GRPO with constant loss normalization.} Since $R_j\in\{0,1\}$,
+$R_j^2=R_j$. Hence
+\begin{equation}
+  \Var(R_j\mid x)=\E[R_j^2\mid x]-\E[R_j\mid x]^2
+  =\eta-\eta^2=\eta(1-\eta).
+\end{equation}
+The group standard deviation converges to $\sqrt{\eta(1-\eta)}$. This is true
+whether the sample variance uses denominator $G$ or $G-1$. Thus
+\begin{equation}
+  \boxed{\displaystyle
+  w_{\mathrm{GRPO}}(x,\pi_{\theta_0})
+    =\frac{1}{\sqrt{\eta_{\theta_0}(x)(1-\eta_{\theta_0}(x))}}.}
+\end{equation}
+
+\textbf{(c) MaxRL.} Here $d_G=\mu_G\as\eta$. Therefore
+\begin{equation}
+  \boxed{\displaystyle
+  w_{\mathrm{MaxRL}}(x,\pi_{\theta_0})
+    =\frac{1}{\eta_{\theta_0}(x)}.}
+\end{equation}
+Equivalently, its population gradient is
+$\E_{x\sim\rho}[\nabla_\theta\log\eta_\theta(x)]$ at $\theta=\theta_0$,
+where the log and expectation are well-defined.
+
+\newpage
+
+\textbf{Why \texttt{stopgrad} matters.}
+In \eqref{eq:frozen-objective}, $\theta$ is differentiated and $\theta_0$ is held
+fixed. This is precisely the meaning of the handout's
+$w(x,\sg(\pi_\theta))$. The derivative does not include an extra
+$\eta_\theta(x)\nabla_\theta w$ term.
+
+MaxRL makes the distinction especially clear:
+\begin{align}
+  J_{\mathrm{MaxRL}}(\theta;\theta_0)
+    &=\E_x\!\left[\frac{\eta_\theta(x)}{\eta_{\theta_0}(x)}\right],\\
+  J_{\mathrm{MaxRL}}(\theta_0;\theta_0)&=1,\\
+  \left.\nabla_\theta J_{\mathrm{MaxRL}}(\theta;\theta_0)\right|_{\theta_0}
+    &=\E_x\!\left[\frac{\left.\nabla_\theta\eta_\theta(x)\right|_{\theta_0}}
+                         {\eta_{\theta_0}(x)}\right].
+\end{align}
+Although the surrogate's value at the current parameters is $1$, its derivative
+with respect to the first argument need not be zero. Simplifying the expression
+to $\eta_\theta/\eta_\theta=1$ before differentiating would incorrectly let the
+denominator vary. For a scalar illustration,
+$f(p;p_0)=p/p_0$ satisfies $f(p_0;p_0)=1$, but
+$\partial f/\partial p=1/p_0$.
+
+\textbf{Connection to the finite-group baseline bias.}
+At finite $G$, $\mu_G$ contains $R_j$, so it is not independent of $S_j$.
+Using independence only for the other samples,
+\begin{align}
+  \E[\mu_GS_j\mid x]
+  &=\frac{1}{G}\E[R_jS_j\mid x]
+    +\frac{1}{G}\sum_{k\ne j}\E[R_k\mid x]\E[S_j\mid x] \notag\\
+  &=\frac{1}{G}\left.\nabla_\theta\eta_\theta(x)\right|_{\theta_0}.
+\end{align}
+Therefore the finite-group Dr. GRPO estimator has expectation
+\begin{equation}
+  \E[\widehat g_G^{\mathrm{Dr.\,GRPO}}(x)\mid x]
+  =\left(1-\frac{1}{G}\right)
+    \left.\nabla_\theta\eta_\theta(x)\right|_{\theta_0}.
+\end{equation}
+The factor tends to $1$, explaining why it does not appear in part (a).
+For (b) and (c), the denominator is also random and correlated with the
+numerator at finite $G$. Replacing an expectation of a ratio by a ratio of
+expectations is unjustified; the preceding derivation uses the large-group
+limit instead.
+
+\textbf{Reading the weights.}
+Dr. GRPO adds no difficulty-dependent multiplier. GRPO's multiplier is
+smallest at $\eta=1/2$ and grows toward both endpoints. MaxRL's multiplier
+decreases as $\eta$ grows, emphasizing harder prompts relative to easier ones.
+For example:
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+Success probability $\eta$ & Dr. GRPO & GRPO & MaxRL \\
+\midrule
+$0.1$ & $1$ & $3.33$ & $10$ \\
+$0.5$ & $1$ & $2$ & $2$ \\
+$0.9$ & $1$ & $3.33$ & $1.11$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+These numbers multiply each prompt's own gradient $\nabla_\theta\eta_\theta(x)$.
+A larger weight alone does not imply a larger resulting gradient norm.
+
+\textbf{Zero denominators and implementation.}
+Without stabilization, GRPO is undefined at $\eta=0$ or $1$, and MaxRL is
+undefined at $\eta=0$. Even when $0<\eta<1$, a finite group can contain identical
+rewards; all centered advantages then vanish. Adding $\varepsilon>0$ to the
+normalizer makes those groups contribute zero. For fixed $\varepsilon$, the
+population weights become
+\begin{equation}
+  w_{\mathrm{GRPO},\varepsilon}(x)
+    =\frac{1}{\sqrt{\eta(x)(1-\eta(x))}+\varepsilon},
+  \qquad
+  w_{\mathrm{MaxRL},\varepsilon}(x)
+    =\frac{1}{\eta(x)+\varepsilon}.
+\end{equation}
+The boxed answers use the problem's unstabilized formulas. They also rely on
+constant loss normalization: dividing each response by its own length
+introduces a response-dependent factor, which this derivation does not remove.
+
+\end{document}
